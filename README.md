@@ -37,4 +37,4 @@ Note: MNIST is downloaded programmatically by the code (no dataset files are inc
 
 ## Novel extensions
 
-Explain the novel extentions.
+Explain the novel extensions.

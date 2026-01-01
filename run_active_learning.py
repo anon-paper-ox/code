@@ -85,14 +85,14 @@ MC_SAMPLES = 20
 
 # Training parameters - these are not explicitly given in the paper
 # Therefore my results will not be exactly the same as in the paper
-# Differet total gradient updates change model performance slightly - shifts learning curves
+# Different total gradient updates change model performance slightly - shifts learning curves
 TRAIN_STEPS = 1000
 TUNE_STEPS  = 500
 
 LR = 1e-3
 WEIGHT_DECAY_GRID = [0.0, 1e-7, 1e-6, 1e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2]
 
-# Small epsilon to avoid log(0) - this is not metioned in the paper but is standard practice.
+# Small epsilon to avoid log(0) - this is not mentioned in the paper but is standard practice.
 # A different small value would not change the results significantly.
 EPS = 1e-10
 
@@ -778,7 +778,6 @@ def plot_figure_5_1(experiment_id: str):
 
     for strat in EXP_5_1_STRATEGIES:
         mean = 100.0 * results[strat]["mean"]
-        std  = 100.0 * results[strat]["std"]
         ax.plot(x, mean, linewidth=2.2, label=label_map.get(strat, strat))
 
     ax.set_xlabel("Acquired images")
