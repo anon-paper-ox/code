@@ -1,3 +1,6 @@
+# AI-generated code in order to test CUDA installation for PyTorch
+
+
 import torch
 
 print("torch:", torch.__version__)
