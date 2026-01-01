@@ -1,5 +1,6 @@
 # ============================================================
 # Active Learning with MC Dropout (MNIST) — Experiments 5.1 / 5.2
+# Reproducing results from Y. Gal, R. Islam, Z. Ghahramani (2017). *Deep Bayesian Active Learning with Image Data*
 # ============================================================
 
 import os
@@ -21,8 +22,13 @@ import torchvision.transforms as transforms
 
 
 # -------------------------
-# 🔇 Silence PyTorch DataLoader cleanup spam (keeps workers=4 + persistent=True)
+# Silence PyTorch DataLoader cleanup spam (keeps workers=4 + persistent=True)
+# The silence_pytorch_dataloader_cleanup_error and silence_multiprocessing_connection_cleanup_error
+# functions are AI-generated code to suppress benign errors during DataLoader cleanup.
+# This does not affect the functionality of the active learning experiments.
 # -------------------------
+
+# Silence DataLoader multiprocessing cleanup AssertionError - AI-generated code
 def silence_pytorch_dataloader_cleanup_error():
     import torch.utils.data.dataloader as dl
     cls = getattr(dl, "_MultiProcessingDataLoaderIter", None)
@@ -37,7 +43,7 @@ def silence_pytorch_dataloader_cleanup_error():
             pass
     cls.__del__ = safe_del
 
-
+# Silence multiprocessing connection cleanup OSError - AI-generated code
 def silence_multiprocessing_connection_cleanup_error():
     import multiprocessing.connection as mp_conn
     base = getattr(mp_conn, "_ConnectionBase", None)
@@ -53,14 +59,14 @@ def silence_multiprocessing_connection_cleanup_error():
             raise
     base.__del__ = safe_del
 
-
+# Apply the silencing functions
 silence_pytorch_dataloader_cleanup_error()
 silence_multiprocessing_connection_cleanup_error()
 
 
 
 # -------------------------
-# Experiment constants
+# Experiment constants from the paper
 # -------------------------
 NUM_CLASSES = 10
 
@@ -72,35 +78,50 @@ NUM_REPEATS = 3
 TOTAL_ROUNDS = 100
 ACQUISITION_SIZE = 10
 
+# The paper does not state the exact number of MC samples used, so this is my choice.
+# Number of MC Dropout samples for acquisition and evaluation.
+# Higher values give more accurate estimates but are slower.
 MC_SAMPLES = 20
 
+# Training parameters - these are not explicitly given in the paper
+# Therefore my results will not be exactly the same as in the paper
+# Differet total gradient updates change model performance slightly - shifts learning curves
 TRAIN_STEPS = 1000
 TUNE_STEPS  = 500
 
 LR = 1e-3
 WEIGHT_DECAY_GRID = [0.0, 1e-7, 1e-6, 1e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2]
 
+# Small epsilon to avoid log(0) - this is not metioned in the paper but is standard practice.
+# A different small value would not change the results significantly.
 EPS = 1e-10
+
+# I have tried some different seed values; they all seem to get similar results as expected.
 SEED = 48
+
 
 BATCH_SIZE_TRAIN = 64
 BATCH_SIZE_EVAL  = 512
+
+# Cuda was the best option for me to run the experiments faster.
+# This is AI-generated code to automatically select the device.
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 PIN_MEMORY = (DEVICE.type == "cuda")
 
 TRANSFORM = transforms.ToTensor()
 MNIST = datasets.MNIST
 
-# ✅ requested
+# This is to speed up the DataLoader operations - these settings worked well for me.
 NUM_WORKERS = 4
 PERSISTENT_WORKERS = True
 PREFETCH_FACTOR = 4
 
+# Logging frequency during active learning rounds - adjust as needed
 LOG_EVERY_ROUNDS = 10
 
 
 # -------------------------
-# Experiment routing
+# Experiment routing - which strategies to run for each experiment in 5.1 and 5.2
 # -------------------------
 EXP_5_1_STRATEGIES = ["BALD", "VarRatios", "MaxEntropy", "MeanSTD", "Random"]
 EXP_5_2_STRATEGIES = ["BALD", "VarRatios", "MaxEntropy"]
@@ -108,8 +129,10 @@ MODES_5_2 = ["bayes", "det"]
 
 
 # -------------------------
-# Quick smoke test config
+# Quick test to see if the code runs without errors and saves files correctly
 # -------------------------
+
+# Set to True to run a quick test with reduced parameters - only for debugging purposes
 QUICK_TEST = False
 
 if QUICK_TEST:
@@ -122,12 +145,12 @@ if QUICK_TEST:
     WEIGHT_DECAY_GRID = [0.0, 1e-4, 1e-2]
     LOG_EVERY_ROUNDS = 1
 
-    EXP_5_1_STRATEGIES = []
+    EXP_5_1_STRATEGIES = ["BALD"]
     EXP_5_2_STRATEGIES = ["BALD"]
 
 
 # -------------------------
-# Paths / IO
+# Paths - some helper functions to save the results and figures to organized directories
 # -------------------------
 def get_results_dir(experiment_id: str) -> str:
     return f"results_{experiment_id}_seed_{SEED}"
@@ -162,11 +185,17 @@ def _load_npz_or_raise(path: str):
         raise FileNotFoundError(f"Missing results file: {path}")
     return np.load(path, allow_pickle=True)
 
+# Atomic save to avoid incomplete writes - was needed when running in colab with interruptions and to save to Google Drive
+# Used to prevent corrupted partial writes and to support resuming long runs; harmless overhead.
+# I changed to save locally instead so this is not needed anymore, but no need to remove it.
 def atomic_savez(path, **kwargs):
     tmp = path + ".tmp.npz"
     np.savez(tmp, **kwargs)
     os.replace(tmp, path)
 
+# This is because experiment 5.2 reuses the results from 5.1 for bayesian modes.
+# So instead of rerunning 5.1, we can just copy the files over if they exist.
+# And as I run everything together these results are already there.
 def reuse_5_1_bayes_as_5_2_bayes(src_exp="5_1", dst_exp="5_2", strategies=None, overwrite=False):
     if strategies is None:
         strategies = ["BALD", "VarRatios", "MaxEntropy"]
@@ -189,8 +218,15 @@ def reuse_5_1_bayes_as_5_2_bayes(src_exp="5_1", dst_exp="5_2", strategies=None, 
 
 
 # -------------------------
-# Seeding helpers
+# Seeding helpers - doing full seeding for better reproducibility
 # -------------------------
+
+# Sets global RNGs (python/numpy/torch). Samplers also use per-sampler torch.Generator seeded separately
+# Note: Full determinism on GPU is not guaranteed by seeding alone.
+# cuDNN / CUDA kernels can introduce nondeterminism.
+# (We prioritise speed; we report averages over repeats.)
+
+
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -205,8 +241,12 @@ def set_torch_seed_only(seed: int):
 
 
 # -------------------------
-# Samplers
+# Samplers - custom samplers instead of SubsetRandomSampler and SubsetSequentialSampler
+# This is because SubsetRandomSampler does not allow changing the indices or num_samples after creation.
+# This enables reusing the same DataLoader with changing indices and num_samples.
+# This is to speed up the active learning loop by avoiding DataLoader re-creation.
 # -------------------------
+
 class MutableSubsetSequentialSampler(Sampler[int]):
     def __init__(self, indices=None):
         self.indices = list(indices) if indices is not None else []
@@ -221,11 +261,8 @@ class MutableSubsetSequentialSampler(Sampler[int]):
         return len(self.indices)
 
 
+# Samples WITH replacement using a seeded torch.Generator; num_samples can exceed len(indices).
 class MutableSubsetReplacementSampler(Sampler[int]):
-    """
-    Samples WITH replacement from indices, returning exactly `num_samples`.
-    With drop_last=True, this yields exactly num_samples / batch_size batches.
-    """
     def __init__(self, indices=None, seed: int = 0, num_samples: int = 0):
         self.indices = list(indices) if indices is not None else []
         self.seed = int(seed)
@@ -237,9 +274,11 @@ class MutableSubsetReplacementSampler(Sampler[int]):
     def set_seed(self, seed: int):
         self.seed = int(seed)
 
+    # Fixed-step training: we sample num_samples = steps * BATCH_SIZE rather than epoch-based loops.
     def set_num_samples(self, num_samples: int):
         self.num_samples = int(num_samples)
 
+    # Samples with replacement from indices using seeded generator
     def __iter__(self):
         if len(self.indices) == 0 or self.num_samples <= 0:
             return iter([])
@@ -254,6 +293,9 @@ class MutableSubsetReplacementSampler(Sampler[int]):
         return self.num_samples
 
 
+# Creating a class to hold shared DataLoaders and Samplers
+# Doing this for efficiency, to avoid recreating DataLoaders multiple times
+# Shared loaders are reused across acquisition rounds to avoid rebuilding DataLoaders (important when using persistent workers)
 @dataclass
 class SharedLoaders:
     train_loader: DataLoader
@@ -264,17 +306,19 @@ class SharedLoaders:
     pool_sampler: MutableSubsetSequentialSampler
 
 
+# Function to enable DataLoader kwargs based on global settings - for consistency and speed
 def _dataloader_kwargs():
     kwargs = dict(
         pin_memory=PIN_MEMORY,
         num_workers=NUM_WORKERS,
         persistent_workers=PERSISTENT_WORKERS,
     )
+    # Performance options (pin_memory/persistent_workers/prefetch_factor); prefetch_factor set only if NUM_WORKERS>0
     if NUM_WORKERS > 0:
         kwargs["prefetch_factor"] = PREFETCH_FACTOR
     return kwargs
 
-
+# Function to build shared DataLoaders for train, val, and pool sets
 def build_shared_loaders(train_full) -> SharedLoaders:
     train_sampler = MutableSubsetReplacementSampler(indices=[], seed=0, num_samples=0)
     val_sampler   = MutableSubsetSequentialSampler(indices=[])
@@ -310,6 +354,7 @@ def build_shared_loaders(train_full) -> SharedLoaders:
     )
 
 
+# Make DataLoader for test set
 def make_test_loader(test_dataset):
     return DataLoader(
         test_dataset,
@@ -320,7 +365,7 @@ def make_test_loader(test_dataset):
 
 
 # -------------------------
-# Data split
+# Data split - initial, validation, pool
 # -------------------------
 def split_indices(train_full, seed):
     set_seed(seed)
@@ -348,7 +393,7 @@ def split_indices(train_full, seed):
 
 
 # -------------------------
-# Model
+# Model - Bayesian CNN with MC Dropout as the paper describes
 # -------------------------
 class SimpleBCNN(nn.Module):
     def __init__(self):
@@ -375,7 +420,7 @@ class SimpleBCNN(nn.Module):
 
 
 # -------------------------
-# Training
+# Training - standard training loop
 # -------------------------
 def train_model(train_idx, weight_decay, steps, shared: SharedLoaders,
                init_state_dict=None, init_seed=None, shuffle_seed=None):
@@ -410,9 +455,11 @@ def train_model(train_idx, weight_decay, steps, shared: SharedLoaders,
 
 
 # -------------------------
-# Predictive helpers
+# Predictive helpers - functions to get predictive probabilities and evaluate accuracy and NLL (Negative Log-Likelihood)
+# For bayesian=True we call model.train() to keep Dropout active for MC Dropout uncertainty estimates
 # -------------------------
 def predictive_probs(model, x, T=MC_SAMPLES, bayesian=True):
+    # Returns mean predictive probabilities and all T samples if bayesian - for all of 5.1 and the bayesian mode of 5.2
     if bayesian:
         model.train()
         B = x.size(0)
@@ -420,6 +467,8 @@ def predictive_probs(model, x, T=MC_SAMPLES, bayesian=True):
         logits = model(x_rep).view(T, B, NUM_CLASSES)
         probs_T = F.softmax(logits, dim=2)
         return probs_T.mean(dim=0), probs_T
+    
+    # Deterministic mode for 5.2
     else:
         model.eval()
         logits = model(x)
@@ -439,7 +488,7 @@ def accuracy(model, loader, T=MC_SAMPLES, bayesian=True):
             total += x.size(0)
     return correct / total
 
-
+# # Monte Carlo estimate of NLL (averages softmax over T stochastic forward passes). Used for Bayesian models in 5.1 and 5.2
 def mc_nll(model, loader, T=MC_SAMPLES):
     model.train()
     total_nll = 0.0
@@ -458,7 +507,7 @@ def mc_nll(model, loader, T=MC_SAMPLES):
             total += B
     return total_nll / total
 
-
+# NLL calculation for deterministic models in 5.2
 def det_nll(model, loader):
     model.eval()
     total_nll = 0.0
@@ -475,7 +524,14 @@ def det_nll(model, loader):
 
 
 # -------------------------
-# Acquisition scoring
+# Acquisition scoring - functions to score pool samples based on acquisition strategy
+# The 5 different strategies from the paper are implemented here:
+# BALD (Bayesian Active Learning by Disagreement)
+# VarRatios (Variance Ratios)
+# MaxEntropy (Maximum Entropy)
+# MeanSTD (Mean Standard Deviation)
+# Random (baseline)
+# The math for these strategies is described in the paper.
 # -------------------------
 def score_pool(model, pool_idx, strategy, shared: SharedLoaders, T=MC_SAMPLES, bayesian=True):
     shared.pool_sampler.set_indices(pool_idx)
@@ -495,9 +551,15 @@ def score_pool(model, pool_idx, strategy, shared: SharedLoaders, T=MC_SAMPLES, b
                     s = -(mean_probs * torch.log(mean_probs + EPS)).sum(dim=1)
                 else:
                     s = probs_T.std(dim=0, unbiased=False).mean(dim=1)
+
+            # BALD requires posterior variability (Bayesian).
+            # For det mode we fall back to random scoring (random tie-break);
+            # alternatives: MaxEntropy fallback or tie-break-only
+            # This is not specified in the paper so this is my choice.
             elif strategy == "BALD":
                 if not bayesian:
-                    s = torch.zeros(mean_probs.size(0), device=mean_probs.device)
+                    # Random tie-break implemented by i.i.d. random scores + top-k (equivalent to uniform random acquisition).
+                    s = torch.rand(mean_probs.size(0), device=mean_probs.device)
                 else:
                     ent_mean = -(mean_probs * torch.log(mean_probs + EPS)).sum(dim=1)
                     ent_each = -(probs_T * torch.log(probs_T + EPS)).sum(dim=2).mean(dim=0)
@@ -511,7 +573,8 @@ def score_pool(model, pool_idx, strategy, shared: SharedLoaders, T=MC_SAMPLES, b
 
 
 # -------------------------
-# Active learning loop
+# Active learning loop - one run of active learning for a given strategy
+# Retrain-from-scratch each round with consistent init_seed=train_seed0 for fair comparisons; shuffle_seed varies per round to vary data order.
 # -------------------------
 def run_active_learning_once(test_loader, shared: SharedLoaders,
                             init_idx, pool_idx, weight_decay, strategy, seed, bayesian=True):
@@ -542,16 +605,21 @@ def run_active_learning_once(test_loader, shared: SharedLoaders,
         pool_idx = [i for i in pool_idx if i not in acquired_set]
 
         train_seed = 10_000 * seed + _round
+        # Use consistent initialization seed across rounds for fair comparison
         model = train_model(train_idx, weight_decay, TRAIN_STEPS, shared,
-                            init_seed=train_seed, shuffle_seed=train_seed)
+                            init_seed=train_seed0, shuffle_seed=train_seed)
         acc_curve.append(accuracy(model, test_loader, T=MC_SAMPLES, bayesian=bayesian))
 
+        # Logging for debugging purposes
         if _round % LOG_EVERY_ROUNDS == 0 or _round == TOTAL_ROUNDS:
             print(f"[{strategy} | bayes={bayesian} | seed={seed}] round {_round}/{TOTAL_ROUNDS} acc={acc_curve[-1]*100:.2f}%")
 
     return acc_curve
 
-
+# Function to tune weight decay using validation set
+# Weight decay is tuned per strategy and per repeat on the 100-point val set
+# (alternative: tune once and reuse across strategies for stricter fairness).
+# This is not specified in the paper so this is my choice.
 def tune_weight_decay(init_idx, val_idx, seed, shared: SharedLoaders, bayesian=True):
     shared.val_sampler.set_indices(val_idx)
 
@@ -582,7 +650,10 @@ def tune_weight_decay(init_idx, val_idx, seed, shared: SharedLoaders, bayesian=T
 
 
 # -------------------------
-# Run one strategy
+# Run one strategy - function to run active learning for one strategy and save results
+# Supports resuming incomplete experiments by loading saved progress
+# When running this in colab I hit max runtime limits, so then I implemented this resume functionality.
+# I have never actually lost progress later though as I started running on laptop GPU instead, so this is just in case.
 # -------------------------
 def run_one_strategy(experiment_id, strategy, train_full, test_loader, shared: SharedLoaders, overwrite=False, mode=None):
     bayesian = True if mode is None else is_bayesian_mode(mode)
@@ -643,9 +714,12 @@ def run_one_strategy(experiment_id, strategy, train_full, test_loader, shared: S
 # -------------------------
 # Summaries + plots
 # -------------------------
+
+# Helper to get acquired x-axis for plots similar to the paper
 def acquired_axis():
     return np.arange(0, (TOTAL_ROUNDS + 1) * ACQUISITION_SIZE, ACQUISITION_SIZE)
 
+# Summarize results for experiment 5.1
 def summarize_5_1(experiment_id: str):
     x = acquired_axis()
     results = {}
@@ -655,6 +729,8 @@ def summarize_5_1(experiment_id: str):
         results[strat] = {"curves": curves, "mean": curves.mean(axis=0), "std": curves.std(axis=0)}
     atomic_savez(summary_path(experiment_id), x_acquired=x, results=results)
 
+
+# Recreate Table 1 from the paper
 def table_5_1_thresholds(experiment_id: str, error_targets=(0.10, 0.05)):
     data = _load_npz_or_raise(summary_path(experiment_id))
     x = data["x_acquired"]
@@ -681,6 +757,7 @@ def table_5_1_thresholds(experiment_id: str, error_targets=(0.10, 0.05)):
                  table=out, x_acquired=x)
     return out
 
+# Plot figure 1 from the paper - active learning curves for experiment 5.1
 def plot_figure_5_1(experiment_id: str):
     data = _load_npz_or_raise(summary_path(experiment_id))
     x = data["x_acquired"]
@@ -717,6 +794,7 @@ def plot_figure_5_1(experiment_id: str):
     plt.close()
     print(f"Saved {out}")
 
+# Summarize results for experiment 5.2
 def summarize_5_2(experiment_id: str):
     x = acquired_axis()
     results = {}
@@ -728,6 +806,7 @@ def summarize_5_2(experiment_id: str):
             results[strat][mode] = {"curves": curves, "mean": curves.mean(axis=0), "std": curves.std(axis=0)}
     atomic_savez(summary_path(experiment_id), x_acquired=x, results=results)
 
+# Plot figure 2 from the paper - active learning curves for experiment 5.2
 def plot_figure_5_2(experiment_id: str):
     data = _load_npz_or_raise(summary_path(experiment_id))
     x = data["x_acquired"]
@@ -789,7 +868,9 @@ def plot_figure_5_2(experiment_id: str):
 
 
 # -------------------------
-# Main
+# Main - run experiments 5.1 and 5.2
+# This is the main entry point to run the experiments.
+# Running both experiments with all strategies and repeats can take several hours on a GPU.
 # -------------------------
 if __name__ == "__main__":
     train_full = MNIST(root="./data", train=True, download=True, transform=TRANSFORM)
@@ -798,6 +879,7 @@ if __name__ == "__main__":
     shared = build_shared_loaders(train_full)
     test_loader = make_test_loader(test_dataset)
 
+    # As mentioned before - quick test mode for debugging only - not for the actual experiments
     if QUICK_TEST:
         exp_5_2 = "5_2_smoke"
         for strategy in EXP_5_2_STRATEGIES:

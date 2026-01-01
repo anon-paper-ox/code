@@ -6,6 +6,9 @@ This repository contains an **anonymous reproduction** of the MNIST active learn
 
 Focus: reproducing the **Section 5.1 and 5.2** MNIST results (multiple acquisition functions + deterministic baseline).
 
+Tested with: Python 3.14.2; PyTorch 2.9.1+cu128; torchvision 0.24.1+cu128; torch CUDA 12.8 (build); NVIDIA driver 577.13 (CUDA 12.9); cuDNN 91002; GPU NVIDIA GeForce RTX 5070 Ti Laptop GPU.
+
+
 ---
 
 ## What's included
