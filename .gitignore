@@ -18,3 +18,6 @@ checkpoints/
 # OS / editor
 .DS_Store
 .vscode/
+
+# Local test files
+scripts/

@@ -97,7 +97,7 @@ WEIGHT_DECAY_GRID = [0.0, 1e-7, 1e-6, 1e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2]
 EPS = 1e-10
 
 # I have tried some different seed values; they all seem to get similar results as expected.
-SEED = 48
+SEED = 30
 
 
 BATCH_SIZE_TRAIN = 64
@@ -780,12 +780,14 @@ def plot_figure_5_1(experiment_id: str):
         mean = 100.0 * results[strat]["mean"]
         ax.plot(x, mean, linewidth=2.2, label=label_map.get(strat, strat))
 
-    ax.set_xlabel("Acquired images")
-    ax.set_ylabel("Test accuracy (%)")
     ax.set_xlim(0, int(x[-1]))
     ax.set_ylim(80, 100)
     ax.set_yticks(np.arange(80, 101, 2))
     ax.legend(loc="lower right", frameon=True, fancybox=False, framealpha=1.0, fontsize=9)
+    
+    # Remove plot border/spines
+    for spine in ax.spines.values():
+        spine.set_visible(False)
 
     out = figure_path_5_1(experiment_id)
     plt.tight_layout()
@@ -847,9 +849,6 @@ def plot_figure_5_2(experiment_id: str):
         ax.plot(x, det_mean, color=DET_COLOR, linewidth=2.5, label=det_label)
         ax.fill_between(x, det_mean - det_std, det_mean + det_std, color=DET_COLOR, alpha=BAND_ALPHA, linewidth=0)
 
-        ax.set_title(titles.get(strat, strat), fontsize=12)
-        ax.set_xlabel("Acquired images")
-        ax.set_ylabel("Test accuracy (%)")
         ax.set_ylim(80, 100)
         ax.set_yticks(np.arange(80, 101, 2))
 
@@ -858,6 +857,10 @@ def plot_figure_5_2(experiment_id: str):
         ax.set_xticks(np.arange(0, max_x + 1, 100))
 
         ax.legend(loc="lower right", frameon=True, fancybox=False, framealpha=1.0, fontsize=9)
+        
+        # Remove plot border/spines
+        for spine in ax.spines.values():
+            spine.set_visible(False)
 
         out = figure_path_5_2_strategy(experiment_id, strat)
         plt.tight_layout()
