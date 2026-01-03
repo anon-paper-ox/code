@@ -192,7 +192,14 @@ NOVEL_A_EXPERIMENT_ID = "novel_A"
 # - BALD (baseline)
 # - BALD_Div (NOVEL A)
 # - Random (sanity)
-NOVEL_A_STRATEGIES = ["BALD", "BALD_Div"]
+NOVEL_A_STRATEGIES = [
+    "BALD", "BALD_Div",
+    "VarRatios", "VarRatios_Div",
+    "MaxEntropy", "MaxEntropy_Div",
+    "MeanSTD", "MeanSTD_Div",
+    "Random",
+]
+
 
 
 # -------------------------

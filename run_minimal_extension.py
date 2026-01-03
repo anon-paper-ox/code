@@ -128,7 +128,7 @@ NUM_REPEATS = 3
 TOTAL_ROUNDS = 100
 ACQUISITION_SIZE = 10
 
-SEED = 45
+SEED = 33
 set_global_determinism(SEED)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -775,6 +775,16 @@ def plot_figure(experiment_id: str):
     x = data["x_acquired"]
     results = data["results"].item()
 
+    # Pretty legend names
+    strategy_name = {
+        "PredVar": "Predictive Variance",
+        "Random": "Random",
+    }
+    inference_name = {
+        "exact": "Exact (Conjugate)",
+        "mfvi": "MFVI (Diagonal)",
+    }
+
     plt.figure(figsize=(6.6, 4.8))
     ax = plt.gca()
     ax.set_axisbelow(True)
@@ -783,21 +793,35 @@ def plot_figure(experiment_id: str):
     for strat in ACQ_STRATEGIES:
         for inf in INFERENCE_METHODS:
             mean = results[strat][inf]["mean"]
-            std  = results[strat][inf]["std"]
-            label = f"{strat}-{inf}"
+            # std  = results[strat][inf]["std"]  # no shading anymore
+
+            label = f"{strategy_name.get(strat, strat)} — {inference_name.get(inf, inf)}"
             ax.plot(x, mean, linewidth=2.2, label=label)
-            ax.fill_between(x, mean - std, mean + std, alpha=0.15, linewidth=0)
+
+            # Removed shading:
+            # ax.fill_between(x, mean - std, mean + std, alpha=0.15, linewidth=0)
 
     ax.set_xlabel("Acquired images")
     ax.set_ylabel("Test RMSE (lower is better)")
     ax.set_xlim(0, int(x[-1]))
-    ax.legend(loc="upper right", frameon=True, fancybox=False, framealpha=1.0, fontsize=9)
+
+    # Slightly nicer legend styling
+    ax.legend(
+        loc="upper right",
+        frameon=True,
+        fancybox=True,
+        framealpha=0.95,
+        fontsize=9,
+        title="Acquisition — Inference",
+        title_fontsize=9,
+    )
 
     out = figure_path(experiment_id)
     plt.tight_layout()
     plt.savefig(out, dpi=200, bbox_inches="tight")
     plt.close()
     print(f"Saved {out}")
+
 
 
 # -------------------------
