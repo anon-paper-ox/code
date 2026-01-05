@@ -20,51 +20,6 @@ from torch.utils.data import DataLoader, Sampler
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 
-
-# -------------------------
-# Silence PyTorch DataLoader cleanup spam (keeps workers=4 + persistent=True)
-# The silence_pytorch_dataloader_cleanup_error and silence_multiprocessing_connection_cleanup_error
-# functions are AI-generated code to suppress benign errors during DataLoader cleanup.
-# This does not affect the functionality of the active learning experiments.
-# -------------------------
-
-# Silence DataLoader multiprocessing cleanup AssertionError - AI-generated code
-def silence_pytorch_dataloader_cleanup_error():
-    import torch.utils.data.dataloader as dl
-    cls = getattr(dl, "_MultiProcessingDataLoaderIter", None)
-    if cls is None:
-        return
-    orig_del = cls.__del__
-    def safe_del(self):
-        try:
-            orig_del(self)
-        except AssertionError:
-            # "can only test a child process"
-            pass
-    cls.__del__ = safe_del
-
-# Silence multiprocessing connection cleanup OSError - AI-generated code
-def silence_multiprocessing_connection_cleanup_error():
-    import multiprocessing.connection as mp_conn
-    base = getattr(mp_conn, "_ConnectionBase", None)
-    if base is None:
-        return
-    orig_del = base.__del__
-    def safe_del(self):
-        try:
-            orig_del(self)
-        except OSError as e:
-            if getattr(e, "errno", None) == 9:  # Bad file descriptor
-                return
-            raise
-    base.__del__ = safe_del
-
-# Apply the silencing functions
-silence_pytorch_dataloader_cleanup_error()
-silence_multiprocessing_connection_cleanup_error()
-
-
-
 # -------------------------
 # Experiment constants from the paper
 # -------------------------
@@ -78,25 +33,23 @@ NUM_REPEATS = 3
 TOTAL_ROUNDS = 100
 ACQUISITION_SIZE = 10
 
-# The paper does not state the exact number of MC samples used, so this is my choice.
-# Number of MC Dropout samples for acquisition and evaluation.
-# Higher values give more accurate estimates but are slower.
+# MC dropout samples (not specified in the paper).
 MC_SAMPLES = 20
 
-# Training parameters - these are not explicitly given in the paper
-# Therefore my results will not be exactly the same as in the paper
-# Different total gradient updates change model performance slightly - shifts learning curves
+
+# Fixed-step training budget per acquisition round (not fully specified in the paper).
 TRAIN_STEPS = 1000
 TUNE_STEPS  = 500
+
 
 LR = 1e-3
 WEIGHT_DECAY_GRID = [0.0, 1e-7, 1e-6, 1e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2]
 
-# Small epsilon to avoid log(0) - this is not mentioned in the paper but is standard practice.
-# A different small value would not change the results significantly.
+# Numerical stability for log/entropy computations.
 EPS = 1e-10
 
-# I have tried some different seed values; they all seem to get similar results as expected.
+
+# Base seed; repeats use SEED + r.
 SEED = 33
 
 
@@ -104,16 +57,15 @@ BATCH_SIZE_TRAIN = 64
 BATCH_SIZE_EVAL  = 512
 
 # Cuda was the best option for me to run the experiments faster.
-# This is AI-generated code to automatically select the device.
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 PIN_MEMORY = (DEVICE.type == "cuda")
 
 TRANSFORM = transforms.ToTensor()
 MNIST = datasets.MNIST
 
-# This is to speed up the DataLoader operations - these settings worked well for me.
+# DataLoader performance settings.
 NUM_WORKERS = 4
-PERSISTENT_WORKERS = True
+PERSISTENT_WORKERS = (NUM_WORKERS > 0)
 PREFETCH_FACTOR = 4
 
 # Logging frequency during active learning rounds - adjust as needed
@@ -133,7 +85,7 @@ MODES_5_2 = ["bayes", "det"]
 # -------------------------
 
 # Set to True to run a quick test with reduced parameters - only for debugging purposes
-QUICK_TEST = True
+QUICK_TEST = False
 
 if QUICK_TEST:
     NUM_REPEATS = 2
@@ -193,9 +145,7 @@ def atomic_savez(path, **kwargs):
     np.savez(tmp, **kwargs)
     os.replace(tmp, path)
 
-# This is because experiment 5.2 reuses the results from 5.1 for bayesian modes.
-# So instead of rerunning 5.1, we can just copy the files over if they exist.
-# And as I run everything together these results are already there.
+# For 5.2, reuse the Bayesian curves from §5.1 instead of rerunning.
 def reuse_5_1_bayes_as_5_2_bayes(src_exp="5_1", dst_exp="5_2", strategies=None, overwrite=False):
     if strategies is None:
         strategies = ["BALD", "VarRatios", "MaxEntropy"]
@@ -221,7 +171,7 @@ def reuse_5_1_bayes_as_5_2_bayes(src_exp="5_1", dst_exp="5_2", strategies=None, 
 # Seeding helpers - doing full seeding for better reproducibility
 # -------------------------
 
-# Sets global RNGs (python/numpy/torch). Samplers also use per-sampler torch.Generator seeded separately
+# Sets global RNGs (python/numpy/torch). Samplers also use per-sampler torch. Generator seeded separately
 # Note: Full determinism on GPU is not guaranteed by seeding alone.
 # cuDNN / CUDA kernels can introduce nondeterminism.
 # (We prioritise speed; we report averages over repeats.)
@@ -425,8 +375,9 @@ class SimpleBCNN(nn.Module):
 def train_model(train_idx, weight_decay, steps, shared: SharedLoaders,
                init_state_dict=None, init_seed=None, shuffle_seed=None):
 
-    if init_seed is not None:
+    if init_state_dict is None and init_seed is not None:
         set_torch_seed_only(init_seed)
+
 
     model = SimpleBCNN()
     if init_state_dict is not None:
@@ -552,13 +503,10 @@ def score_pool(model, pool_idx, strategy, shared: SharedLoaders, T=MC_SAMPLES, b
                 else:
                     s = probs_T.std(dim=0, unbiased=False).mean(dim=1)
 
-            # BALD requires posterior variability (Bayesian).
-            # For det mode we fall back to random scoring (random tie-break);
-            # alternatives: MaxEntropy fallback or tie-break-only
-            # This is not specified in the paper so this is my choice.
+            # Deterministic BALD has zero mutual information (constant), so we use random tie-breaking.
             elif strategy == "BALD":
                 if not bayesian:
-                    # Random tie-break implemented by i.i.d. random scores + top-k (equivalent to uniform random acquisition).
+                    # Random tie-break (equivalent to random acquisition).
                     s = torch.rand(mean_probs.size(0), device=mean_probs.device)
                 else:
                     ent_mean = -(mean_probs * torch.log(mean_probs + EPS)).sum(dim=1)
@@ -577,7 +525,7 @@ def score_pool(model, pool_idx, strategy, shared: SharedLoaders, T=MC_SAMPLES, b
 # Retrain-from-scratch each round with consistent init_seed=train_seed0 for fair comparisons; shuffle_seed varies per round to vary data order.
 # -------------------------
 def run_active_learning_once(test_loader, shared: SharedLoaders,
-                            init_idx, pool_idx, weight_decay, strategy, seed, bayesian=True):
+                            init_idx, pool_idx, weight_decay, strategy, seed, bayesian=True, init_state_dict=None):
 
     set_seed(seed)
     train_idx = list(init_idx)
@@ -587,7 +535,8 @@ def run_active_learning_once(test_loader, shared: SharedLoaders,
 
     train_seed0 = 10_000 * seed + 0
     model = train_model(train_idx, weight_decay, TRAIN_STEPS, shared,
-                        init_seed=train_seed0, shuffle_seed=train_seed0)
+                        init_seed=train_seed0, shuffle_seed=train_seed0,
+                        init_state_dict=init_state_dict)
     acc_curve.append(accuracy(model, test_loader, T=MC_SAMPLES, bayesian=bayesian))
 
     for _round in range(1, TOTAL_ROUNDS + 1):
@@ -607,7 +556,7 @@ def run_active_learning_once(test_loader, shared: SharedLoaders,
         train_seed = 10_000 * seed + _round
         # Use consistent initialization seed across rounds for fair comparison
         model = train_model(train_idx, weight_decay, TRAIN_STEPS, shared,
-                            init_seed=train_seed0, shuffle_seed=train_seed)
+                            init_seed=train_seed0, shuffle_seed=train_seed, init_state_dict=init_state_dict)
         acc_curve.append(accuracy(model, test_loader, T=MC_SAMPLES, bayesian=bayesian))
 
         # Logging for debugging purposes
@@ -620,12 +569,14 @@ def run_active_learning_once(test_loader, shared: SharedLoaders,
 # Weight decay is tuned per strategy and per repeat on the 100-point val set
 # (alternative: tune once and reuse across strategies for stricter fairness).
 # This is not specified in the paper so this is my choice.
-def tune_weight_decay(init_idx, val_idx, seed, shared: SharedLoaders, bayesian=True):
+def tune_weight_decay(init_idx, val_idx, seed, shared: SharedLoaders, bayesian=True, init_state_dict=None):
     shared.val_sampler.set_indices(val_idx)
 
-    set_seed(seed)
-    base_model = SimpleBCNN()
-    init_state = {k: v.clone() for k, v in base_model.state_dict().items()}
+    # Use provided init weights if available; otherwise fall back (old behavior).
+    if init_state_dict is None:
+        set_seed(seed)
+        base_model = SimpleBCNN()
+        init_state_dict = {k: v.clone() for k, v in base_model.state_dict().items()}
 
     best_wd = None
     best_val = float("inf")
@@ -633,7 +584,7 @@ def tune_weight_decay(init_idx, val_idx, seed, shared: SharedLoaders, bayesian=T
 
     for wd in WEIGHT_DECAY_GRID:
         model = train_model(init_idx, wd, TUNE_STEPS, shared,
-                            init_state_dict=init_state,
+                            init_state_dict=init_state_dict,
                             init_seed=12345 + seed,
                             shuffle_seed=67890 + seed)
 
@@ -681,7 +632,16 @@ def run_one_strategy(experiment_id, strategy, train_full, test_loader, shared: S
         print("=" * 60)
 
         init_idx, val_idx, pool_idx = split_indices(train_full, repeat_seed)
-        best_wd = tune_weight_decay(init_idx, val_idx, seed=repeat_seed, shared=shared, bayesian=bayesian)
+        
+        # Create the exact same initialization used for the active-learning training runs
+        train_seed0 = 10_000 * repeat_seed + 0
+        set_torch_seed_only(train_seed0)
+        base_model = SimpleBCNN()
+        init_state_dict = {k: v.clone() for k, v in base_model.state_dict().items()}
+
+        
+        best_wd = tune_weight_decay(init_idx, val_idx, seed=repeat_seed, shared=shared,
+                            bayesian=bayesian, init_state_dict=init_state_dict)
 
         acc_curve = run_active_learning_once(
             test_loader=test_loader,
@@ -692,7 +652,9 @@ def run_one_strategy(experiment_id, strategy, train_full, test_loader, shared: S
             strategy=strategy,
             seed=repeat_seed,
             bayesian=bayesian,
+            init_state_dict=init_state_dict,
         )
+
 
         curves_done.append(np.array(acc_curve, dtype=np.float32))
         wds_done.append(best_wd)
@@ -816,11 +778,6 @@ def plot_figure_5_2(experiment_id: str):
     BAYES_COLOR = "#d62728"
     DET_COLOR   = "#1f77b4"
     BAND_ALPHA  = 0.18
-
-    BAYES_LABEL = "Bayesian CNN"
-    DET_LABEL   = "Deterministic CNN"
-
-    titles = {"BALD": "(a) BALD", "VarRatios": "(b) Var Ratios", "MaxEntropy": "(c) Max Entropy"}
 
     for strat in EXP_5_2_STRATEGIES:
         plt.figure(figsize=(6.2, 4.8))

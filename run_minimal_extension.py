@@ -1,47 +1,16 @@
 # ============================================================
 # Active Learning with Frozen Features + Bayesian Last Layer (MNIST Regression)
 # ============================================================
-#
+
 # -------------------------
-# ASSUMPTIONS (made explicit here and throughout the code)
+# Overview (what this file does)
 # -------------------------
-# A1. Task: MNIST classification labels are converted to *continuous* one-hot vectors
-#     y_n in R^{10}. We evaluate test performance using RMSE on these vectors.
-#
-# A2. Model (neural linear / hierarchical basis function regression):
-#     We use a neural network feature extractor phi_theta(x) (a ConvNet), and a *linear* last layer:
-#         f(x) = phi_theta(x)^T W   where W in R^{D x K}, K=10.
-#     Theta is treated as fixed ("frozen features") during active learning and last-layer inference.
-#
-# A3. Likelihood: isotropic Gaussian noise shared across outputs:
-#         y_n | W, x_n ~ N( phi(x_n)^T W ,  sigma^2 I_K ).
-#     (This matches the lecture setup; it implies the predictive covariance is a scalar times I_K.)
-#
-# A4. Prior: independent Gaussian prior over last-layer weights:
-#         vec(W) ~ N(0, alpha^{-1} I_{D*K}).
-#     Equivalently, each output column has the same ridge prior.
-#
-# A5. Exact inference: since (A3)-(A4) are linear-Gaussian, p(W|D) is available in closed form.
-#
-# A6. MFVI: we use the mean-field family from the lectures (diagonal covariance in vec(W)).
-#     For this linear-Gaussian model, the KL-optimal mean equals the exact posterior mean.
-#     The KL-optimal diagonal covariance has an analytic fixed point (also shown in the lectures).
-#     Under (A3)-(A4), the optimal diagonal variance is identical across the K outputs for each feature
-#     dimension, so we store it as a length-D vector.
-#
-# A7. Acquisition function: predictive variance of the *regression outputs*.
-#     Since (A3) yields a KxK predictive covariance that is scalar*I_K, any scalarisation
-#     (trace, determinant, sum of marginal variances) ranks points identically.
-#     We use TRACE by default: a(x) = tr(Cov[y*|x,D]) = K*(sigma^2 + phi^T Cov_W phi).
-#
-# A8. Feature pretraining: optional self-supervised *rotation prediction* pretraining on the
-#     *unlabelled* training images (labels are not used). This makes phi_theta(x) non-random
-#     while still consistent with a pool-based AL setting.
-#
-# NOTE: If you want the predictive covariance to be genuinely non-diagonal across outputs,
-#       you need a likelihood/prior with output correlations (a possible NOVEL extension).
-#
-# ============================================================
+# - Treat MNIST labels as one-hot vectors in R^10 and fit them with a Gaussian regression model.
+# - Precompute frozen ConvNet features phi(x) once (optionally via rotation pretraining on the train images).
+# - Do Bayesian linear regression on the last layer: exact posterior vs diagonal MFVI approximation.
+# - Active learning score: predictive variance (trace), which is simple under isotropic noise.
+
+
 
 import os
 import random
@@ -58,55 +27,13 @@ from torch.utils.data import DataLoader, Dataset
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 
-# -------------------------
-# (Optional) Windows/PyTorch DataLoader cleanup spam suppressors
-# Keeps NUM_WORKERS>0 + persistent_workers=True from printing noisy teardown errors.
-# ASSUMPTION: This does not change the computation; it only suppresses benign shutdown exceptions.
-# -------------------------
-def silence_pytorch_dataloader_cleanup_error():
-    import torch.utils.data.dataloader as dl
-    cls = getattr(dl, "_MultiProcessingDataLoaderIter", None)
-    if cls is None:
-        return
-    orig_del = cls.__del__
-
-    def safe_del(self):
-        try:
-            orig_del(self)
-        except AssertionError:
-            pass
-
-    cls.__del__ = safe_del
-
-
-def silence_multiprocessing_connection_cleanup_error():
-    import multiprocessing.connection as mp_conn
-    base = getattr(mp_conn, "_ConnectionBase", None)
-    if base is None:
-        return
-    orig_del = base.__del__
-
-    def safe_del(self):
-        try:
-            orig_del(self)
-        except OSError as e:
-            # errno 9 = Bad file descriptor (benign during interpreter shutdown on some platforms)
-            if getattr(e, "errno", None) == 9:
-                return
-            raise
-
-    base.__del__ = safe_del
-
-
-silence_pytorch_dataloader_cleanup_error()
-silence_multiprocessing_connection_cleanup_error()
-
 
 # -------------------------
-# Global determinism helpers
+# Seeding / reproducibility
+# Note: cuDNN deterministic mode can be slower; this is "best effort" reproducibility.
 # -------------------------
+
 def set_global_determinism(seed: int):
-    """Best-effort deterministic behavior (still not 100% on all GPU ops)."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -115,10 +42,21 @@ def set_global_determinism(seed: int):
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 
+def seed_worker(worker_id: int):
+    # Ensures numpy/random are seeded inside each DataLoader worker
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 
 # -------------------------
 # Experiment constants
 # -------------------------
+# Pool-based AL loop: start with a tiny stratified seed set, then acquire ACQUISITION_SIZE per round.
+# We tune last-layer hyperparameters on a small labeled validation set (VAL_SIZE).
+# Hyperparameters (alpha, sigma2) are tuned once per repeat using init+val, then kept fixed during acquisitions.
+
 NUM_CLASSES = 10  # output dim for one-hot regression
 INITIAL_POINTS_PER_CLASS = 2
 VAL_SIZE = 100
@@ -134,8 +72,8 @@ set_global_determinism(SEED)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 PIN_MEMORY = (DEVICE.type == "cuda")
 
-BATCH_SIZE_FEATURES = 512    # used for feature precompute
-BATCH_SIZE_PRETRAIN = 256
+BATCH_SIZE_FEATURES = 512    # feature precompute throughput
+BATCH_SIZE_PRETRAIN = 256    # rotation pretraining throughput
 
 # Normalisation is standard for MNIST; helps feature learning.
 TRANSFORM = transforms.Compose([
@@ -146,7 +84,6 @@ TRANSFORM = transforms.Compose([
 MNIST = datasets.MNIST
 
 NUM_WORKERS = 4
-PERSISTENT_WORKERS = True
 PREFETCH_FACTOR = 4
 
 LOG_EVERY_ROUNDS = 10
@@ -155,16 +92,19 @@ LOG_EVERY_ROUNDS = 10
 ACQ_STRATEGIES = ["PredVar", "Random"]
 
 # Two required last-layer inference methods
+# Note: for this linear-Gaussian last layer, MFVI matches the exact posterior mean; it mainly differs in uncertainty.
+
 INFERENCE_METHODS = ["exact", "mfvi"]
 
-# Hyperparameter grids:
-#   alpha  = prior precision (1 / prior variance)
-#   sigma2 = likelihood noise variance
+# Last-layer hyperparameters (tuned on the validation set each repeat):
+# - alpha:  prior precision
+# - sigma2: observation noise variance
 ALPHA_GRID  = [1e-6, 1e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 1.0, 10.0]
 SIGMA2_GRID = [1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 3e-1, 1.0]
 
 JITTER = 1e-8  # numerical stabiliser for Cholesky
-EPS = 1e-30
+EPS = 1e-8   # numerical floor for sqrt/log/clamp in float32
+EPS_DENOM = 1e-30 # denominator safety (e.g. 1/(x + eps))
 
 # Feature pretraining (self-supervised rotation prediction)
 PRETRAIN_FEATURE_EXTRACTOR = True
@@ -174,7 +114,10 @@ PRETRAIN_LR = 1e-3
 
 # -------------------------
 # IO helpers
+# Save per-(strategy,inference) curves as .npz and keep a summary file for plotting.
+# atomic_savez avoids half-written files if a run is interrupted.
 # -------------------------
+
 def get_results_dir(experiment_id: str) -> str:
     return f"results_{experiment_id}_seed_{SEED}"
 
@@ -206,12 +149,13 @@ def load_npz_or_raise(path: str):
 
 # -------------------------
 # Data split (init / val / pool)
+# - init: INITIAL_POINTS_PER_CLASS per class
+# - val:  VAL_SIZE labeled points (for hyperparameter tuning)
+# - pool: remaining unlabeled points (for acquisition)
+# Deterministic given `seed` (we re-seed inside for repeatability of init/val/pool splits).
 # -------------------------
+
 def split_indices_stratified(train_full: Dataset, seed: int) -> Tuple[List[int], List[int], List[int]]:
-    """
-    Stratified initial set: INITIAL_POINTS_PER_CLASS per digit.
-    Remaining points are split into a small labeled validation set and an unlabeled pool.
-    """
     set_global_determinism(seed)
     targets = train_full.targets.cpu().numpy()
 
@@ -237,13 +181,10 @@ def split_indices_stratified(train_full: Dataset, seed: int) -> Tuple[List[int],
 
 
 # -------------------------
-# Frozen Feature Extractor (basis functions)
+# Frozen feature extractor (basis functions)
+# FeatureNet defines phi(x). We train it once (optional) and then freeze it for the AL loop.
 # -------------------------
 class FeatureNet(nn.Module):
-    """
-    ConvNet feature extractor used as basis function map phi_theta(x).
-    The last-layer Bayesian regression happens on top of these features.
-    """
     def __init__(self, feat_dim: int = 128):
         super().__init__()
         self.conv1 = nn.Conv2d(1, 32, kernel_size=4)
@@ -262,46 +203,52 @@ class FeatureNet(nn.Module):
 
 # -------------------------
 # Optional self-supervised pretraining: rotation prediction
+# We convert MNIST into a 4-way rotation classification task.
+# Deterministic assignment (no 4× expansion): for each image at dataset index `idx`,
+# we set the rotation label r = idx % 4 and rotate by {0°, 90°, 180°, 270°} accordingly.
+# Label mapping: r ∈ {0,1,2,3} corresponds to rotation ∈ {0°, 90°, 180°, 270°}.
 # -------------------------
 class RotationDataset(Dataset):
-    """
-    Wraps an image dataset to create a rotation prediction task:
-      - rotation label r in {0,1,2,3} corresponds to rotating by 0, 90, 180, 270 degrees.
-    We choose r deterministically from index to avoid extra randomness.
-    """
+
     def __init__(self, base: Dataset):
         self.base = base
 
-    def __len__(self) -> int:
-        return len(self.base)
-
-    def __getitem__(self, idx: int):
-        x, _ = self.base[idx]  # ignore digit label
+    def __len__(self): return len(self.base)
+    def __getitem__(self, idx):
+        x,_ = self.base[idx]
         r = idx % 4
-        # x is (1,H,W). Rotate along H,W dims.
-        x = torch.rot90(x, k=r, dims=(1, 2))
+        x = torch.rot90(x, k=r, dims=(1,2))
         return x, r
 
 
-def dataloader_kwargs():
-    # ASSUMPTION: using DataLoader workers is an implementation detail; it should not change maths.
-    kwargs = dict(pin_memory=PIN_MEMORY, num_workers=NUM_WORKERS)
+
+# DataLoader settings (throughput-oriented; does not affect the math).
+def dataloader_kwargs(seed: int):
+    g = torch.Generator()
+    g.manual_seed(seed)
+
+    kwargs = dict(
+        pin_memory=PIN_MEMORY,
+        num_workers=NUM_WORKERS,
+        generator=g,
+    )
     if NUM_WORKERS > 0:
-        kwargs["persistent_workers"] = PERSISTENT_WORKERS
-        kwargs["prefetch_factor"] = PREFETCH_FACTOR
+        kwargs.update(
+            persistent_workers=True,
+            prefetch_factor=PREFETCH_FACTOR,
+            worker_init_fn=seed_worker,
+        )
     return kwargs
 
 
+
+# Rotation pretraining: train FeatureNet + a small 4-class head, then freeze FeatureNet weights.
 def pretrain_feature_extractor(feature_net: FeatureNet, train_full: Dataset):
-    """
-    Self-supervised rotation prediction pretraining.
-    Uses only images (no MNIST digit labels), consistent with pool-based AL.
-    """
     feature_net = feature_net.to(DEVICE)
     head = nn.Linear(feature_net.fc1.out_features, 4).to(DEVICE)
 
     ds = RotationDataset(train_full)
-    loader = DataLoader(ds, batch_size=BATCH_SIZE_PRETRAIN, shuffle=True, **dataloader_kwargs())
+    loader = DataLoader(ds, batch_size=BATCH_SIZE_PRETRAIN, shuffle=True, **dataloader_kwargs(SEED))
 
     opt = torch.optim.Adam(list(feature_net.parameters()) + list(head.parameters()), lr=PRETRAIN_LR)
 
@@ -335,14 +282,12 @@ def pretrain_feature_extractor(feature_net: FeatureNet, train_full: Dataset):
 
 # -------------------------
 # Feature precompute
+# We embed all train/test images once into Phi (and append a bias column).
+# This keeps the AL loop fast: last-layer updates are just linear algebra.
 # -------------------------
 @torch.inference_mode()
 def compute_features(feature_net: FeatureNet, dataset: Dataset, feat_dim: int) -> torch.Tensor:
-    """
-    Returns Phi (N, D+1) with appended bias term.
-    Phi is stored on DEVICE for fast linear algebra.
-    """
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE_FEATURES, shuffle=False, **dataloader_kwargs())
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE_FEATURES, shuffle=False, **dataloader_kwargs(SEED))
     feats = []
     feature_net.eval()
 
@@ -354,6 +299,7 @@ def compute_features(feature_net: FeatureNet, dataset: Dataset, feat_dim: int) -
     Phi = torch.cat(feats, dim=0)  # (N, D)
     ones = torch.ones(Phi.size(0), 1, device=Phi.device, dtype=Phi.dtype)
     Phi = torch.cat([Phi, ones], dim=1)  # (N, D+1)
+    # sanity check: D features + 1 bias column
     assert Phi.size(1) == feat_dim + 1
     return Phi
 
@@ -362,21 +308,17 @@ def one_hot_targets_from_digits(digits: torch.Tensor, num_classes: int = 10) -> 
     return F.one_hot(digits.to(torch.int64), num_classes=num_classes).to(torch.float32)
 
 
+# Precompute:
+# - Phi_train_all / Phi_test: frozen features with a bias column (D+1)
+# - Y_train_all / Y_test: one-hot targets in R^10
+# All tensors are kept on DEVICE for fast posterior updates.
 def precompute_features_and_targets(train_full: Dataset, test_dataset: Dataset, feat_dim: int = 128):
-    """
-    Returns:
-      Phi_train_all: (N_train, D) on DEVICE
-      Y_train_all:   (N_train, K) on DEVICE
-      Phi_test:      (N_test, D) on DEVICE
-      Y_test:        (N_test, K) on DEVICE
-    """
-    set_global_determinism(SEED)
     feature_net = FeatureNet(feat_dim=feat_dim)
 
     if PRETRAIN_FEATURE_EXTRACTOR:
         feature_net = pretrain_feature_extractor(feature_net, train_full)
     else:
-        # ASSUMPTION: random features; this is weaker but still a valid frozen-feature baseline.
+        # No pretraining: use random frozen features as a weak baseline.
         feature_net = feature_net.to(DEVICE)
         feature_net.eval()
         for p in feature_net.parameters():
@@ -392,14 +334,16 @@ def precompute_features_and_targets(train_full: Dataset, test_dataset: Dataset, 
 
 
 # -------------------------
-# Bayesian last-layer inference (multi-output linear regression)
+# Bayesian last-layer inference
+# Multi-output linear regression with shared feature covariance across outputs (isotropic prior/noise).
 # -------------------------
 @dataclass
 class PosteriorExact:
-    mean_W: torch.Tensor  # (D, K)
-    A_inv: torch.Tensor   # (D, D) covariance shared across outputs
+    mean_W: torch.Tensor   # (D, K)
+    chol_A: torch.Tensor   # (D, D) lower-triangular Cholesky factor of A
     alpha: float
     sigma2: float
+
 
 @dataclass
 class PosteriorMFVI:
@@ -409,13 +353,11 @@ class PosteriorMFVI:
     sigma2: float
 
 
+# Exact Bayesian ridge regression on the last layer.
+# A = alpha I + (1/sigma2) Phi^T Phi
+# mean_W = A^{-1} (1/sigma2) Phi^T Y
+# Shared covariance across outputs: Cov(vec(W)) = I_K ⊗ A^{-1}
 def fit_last_layer_exact(Phi: torch.Tensor, Y: torch.Tensor, alpha: float, sigma2: float) -> PosteriorExact:
-    """
-    Exact conjugate posterior under (A3)-(A4):
-      A = alpha I + (1/sigma2) Phi^T Phi
-      mean_W = A^{-1} (1/sigma2) Phi^T Y
-      Cov(vec(W)) = I_K \\otimes A^{-1}
-    """
     Phi64 = Phi.to(torch.float64)
     Y64   = Y.to(torch.float64)
     D = Phi64.size(1)
@@ -424,37 +366,31 @@ def fit_last_layer_exact(Phi: torch.Tensor, Y: torch.Tensor, alpha: float, sigma
     A = A + (Phi64.T @ Phi64) / sigma2
     A = A + JITTER * torch.eye(D, device=A.device, dtype=A.dtype)
 
-    L = torch.linalg.cholesky(A)  # A = L L^T
-    rhs = (Phi64.T @ Y64) / sigma2  # (D, K)
+    L = torch.linalg.cholesky(A)  # A = L L^T (L is lower-triangular)
+
+    rhs = (Phi64.T @ Y64) / sigma2
     mean_W = torch.cholesky_solve(rhs, L)  # A^{-1} rhs
-    A_inv = torch.cholesky_inverse(L)
 
     return PosteriorExact(
         mean_W=mean_W.to(torch.float32),
-        A_inv=A_inv.to(torch.float32),
+        chol_A=L.to(torch.float32),
         alpha=float(alpha),
         sigma2=float(sigma2),
     )
 
 
+
+# Diagonal MFVI approximation for the last layer.
+# - We reuse the exact posterior mean (optimal for linear-Gaussian).
+# - Variances use the standard diagonal fixed point:
+#     diag_S[j] = 1 / (alpha + (1/sigma2) * sum_n Phi[n,j]^2)
+# Note: diag_S is not diag(A^{-1}); it is 1 / diag(A).
 def fit_last_layer_mfvi(Phi: torch.Tensor, Y: torch.Tensor, alpha: float, sigma2: float) -> PosteriorMFVI:
-    """
-    Mean-field VI from the lectures for linear-Gaussian regression.
-    We use the diagonal covariance family q(vec(W)) with analytic fixed point.
-
-    Key facts (A6):
-      - KL-optimal mean matches exact posterior mean.
-      - KL-optimal diagonal covariance has elements:
-            diag_S[j] = 1 / ( alpha + (1/sigma2) * sum_n Phi[n,j]^2 )
-        and is shared across outputs when prior/noise are isotropic.
-
-    NOTE: This is *not* the same as diag(A^{-1}); it is the inverse of the diagonal of A.
-    """
     post_exact = fit_last_layer_exact(Phi, Y, alpha=alpha, sigma2=sigma2)
 
     Phi2_sum = (Phi.to(torch.float64) ** 2).sum(dim=0)  # (D,)
     diag_prec = alpha + Phi2_sum / sigma2               # (D,)
-    diag_S = (1.0 / (diag_prec + EPS)).to(torch.float32)
+    diag_S = (1.0 / (diag_prec + EPS_DENOM)).to(torch.float32)
 
     return PosteriorMFVI(
         mean_W=post_exact.mean_W,
@@ -466,55 +402,49 @@ def fit_last_layer_mfvi(Phi: torch.Tensor, Y: torch.Tensor, alpha: float, sigma2
 
 # -------------------------
 # Predictions / metrics
+# RMSE is computed on one-hot vectors; NLL uses the same isotropic Gaussian model as training.
 # -------------------------
 @torch.inference_mode()
 def predict_mean(Phi: torch.Tensor, mean_W: torch.Tensor) -> torch.Tensor:
     return Phi @ mean_W  # (N, K)
 
 
+# Predictive variance for one output dimension (exact):
+#   v(x) = sigma2 + phi^T A^{-1} phi, computed via Cholesky factor A = L L^T
 @torch.inference_mode()
 def predictive_var_scalar_exact(Phi: torch.Tensor, post: PosteriorExact) -> torch.Tensor:
-    """
-    Returns scalar predictive variance per sample for ONE output dimension:
-      v(x) = sigma2 + phi^T A_inv phi
-    Under (A3) this is identical for all K outputs.
-    """
-    tmp = Phi @ post.A_inv          # (N, D)
-    quad = (tmp * Phi).sum(dim=1)   # (N,)
+    # quad = phi^T A^{-1} phi = || L^{-1} phi ||^2 where A = L L^T
+    # Solve L * X = Phi^T  -> X = L^{-1} Phi^T
+    X = torch.linalg.solve_triangular(post.chol_A, Phi.T, upper=False)  # (D, N)
+    quad = (X * X).sum(dim=0)  # (N,)
     return quad + post.sigma2
 
 
+# Predictive variance for one output dimension (MFVI):
+#   v(x) = sigma2 + sum_j phi_j^2 * diag_S[j]
 @torch.inference_mode()
 def predictive_var_scalar_mfvi(Phi: torch.Tensor, post: PosteriorMFVI) -> torch.Tensor:
-    """
-    MFVI predictive variance per sample for ONE output dimension:
-      v(x) = sigma2 + sum_j phi_j^2 * diag_S[j]
-    """
     quad = (Phi * Phi * post.diag_S.unsqueeze(0)).sum(dim=1)
     return quad + post.sigma2
 
 
+# Under isotropic likelihood, Cov[y*|x,D] = var_scalar(x) * I_K, so trace = K * var_scalar.
 @torch.inference_mode()
 def acquisition_trace_from_var_scalar(var_scalar: torch.Tensor, K: int = NUM_CLASSES) -> torch.Tensor:
-    """
-    Since Cov[y*|x,D] = var_scalar(x) * I_K under (A3), the trace is K * var_scalar.
-    """
+    # Multiplying by K does not change the ranking; we keep it so the score equals trace(Cov[y|x]).
     return K * var_scalar
 
-
+# RMSE on one-hot targets is just a simple scalar metric for this regression framing.
 @torch.inference_mode()
 def rmse_from_preds(mu: torch.Tensor, Y: torch.Tensor) -> float:
     mse = (mu - Y).pow(2).mean()
     return float(torch.sqrt(mse + EPS).item())
 
 
+# Mean NLL for isotropic Gaussian outputs with per-sample scalar variance:
+#   NLL(x) = 0.5 * [ K log(2*pi*var) + ||y-mu||^2 / var ]
 @torch.inference_mode()
 def nll_gaussian_isotropic(mu: torch.Tensor, var_scalar: torch.Tensor, Y: torch.Tensor) -> float:
-    """
-    NLL for multi-output isotropic Gaussian with per-sample scalar variance:
-      y in R^K
-      NLL = 0.5 * [ K log(2*pi*var) + ||y-mu||^2 / var ]
-    """
     K = Y.size(1)
     var = var_scalar.clamp_min(EPS)
     sq = (Y - mu).pow(2).sum(dim=1)
@@ -523,7 +453,8 @@ def nll_gaussian_isotropic(mu: torch.Tensor, var_scalar: torch.Tensor, Y: torch.
 
 
 # -------------------------
-# Hyperparameter tuning (alpha, sigma2) on validation NLL
+# Hyperparameter tuning (alpha, sigma2)
+# Simple grid search on the validation set using Gaussian NLL.
 # -------------------------
 def tune_hyperparams(
     Phi_train_all: torch.Tensor,
@@ -575,6 +506,7 @@ def tune_hyperparams(
 
 # -------------------------
 # Active learning loop
+# Features stay fixed. Each round: score pool -> acquire -> refit last-layer posterior -> evaluate on test.
 # -------------------------
 def run_active_learning_once(
     Phi_train_all: torch.Tensor,
@@ -617,6 +549,7 @@ def run_active_learning_once(
         if strategy == "Random":
             acquired = random.sample(pool_idx, ACQUISITION_SIZE)
 
+        # Score pool points by predictive variance of the regression output y (trace under isotropic noise).
         elif strategy == "PredVar":
             idx_pool = torch.as_tensor(pool_idx, device=Phi_train_all.device, dtype=torch.long)
             Phi_pool = Phi_train_all.index_select(0, idx_pool)
@@ -659,8 +592,10 @@ def run_active_learning_once(
 
 
 # -------------------------
-# Run one setting (strategy + inference), with resume support
+# Run one setting (strategy + inference)
+# Each repeat: new split + tune hyperparameters on val + run AL loop; results are saved incrementally.
 # -------------------------
+
 def run_one_setting(
     experiment_id: str,
     strategy: str,
@@ -731,13 +666,6 @@ def run_one_setting(
             curves=np.stack(curves_done, axis=0).astype(np.float32),
             best_hypers_per_repeat=np.array(hypers_done, dtype=np.float64),
             seeds=np.array(seeds_done, dtype=np.int64),
-            assumptions=np.array([
-                "A3: y|W ~ N(phi^T W, sigma^2 I_K)",
-                "A4: vec(W) ~ N(0, alpha^{-1} I)",
-                "A6: MFVI uses diagonal q(vec(W)) with analytic fixed point",
-                "A7: acquisition uses trace of predictive covariance",
-                "A8: feature extractor optionally pretrained via rotation prediction"
-            ], dtype=object),
         )
         print(f"[SAVED] {save_path} (repeats completed: {len(curves_done)}/{NUM_REPEATS})")
 
@@ -746,7 +674,9 @@ def run_one_setting(
 
 # -------------------------
 # Summaries + plot
+# Summarize curves across repeats (mean/std) and plot RMSE vs acquired labels.
 # -------------------------
+
 def acquired_axis() -> np.ndarray:
     # 0, 10, 20, ..., 1000 for TOTAL_ROUNDS=100 and ACQUISITION_SIZE=10
     return np.arange(0, (TOTAL_ROUNDS + 1) * ACQUISITION_SIZE, ACQUISITION_SIZE, dtype=np.int64)
@@ -826,6 +756,7 @@ def plot_figure(experiment_id: str):
 
 # -------------------------
 # Main
+# Precompute frozen features once, then run the AL loop purely in feature space.
 # -------------------------
 if __name__ == "__main__":
     train_full = MNIST(root="./data", train=True, download=True, transform=TRANSFORM)
